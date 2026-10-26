@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# scripts/keel-time — session clock (Keel v6.4+). Reads the system clock; never invents times.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLOCK_DIR="$ROOT/docs/.keel"
+CLOCK="$CLOCK_DIR/clock.jsonl"
+SESSIONS="$ROOT/docs/sessions.md"
+PLAN_JSON="$ROOT/docs/.keel/plan.json"
+PLAN_REGEN="$ROOT/scripts/keel-plan-regen"
+
+mkdir -p "$CLOCK_DIR"
+touch "$CLOCK"
+
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+local_now() { date +"%Y-%m-%d %H:%M %Z"; }
+
+append_event() {
+  # $1 = json object body without surrounding braces extras — we pass full JSON line
+  printf '%s\n' "$1" >> "$CLOCK"
+}
+
+latest_session_id() {
+  python3 - "$CLOCK" <<'PY'
+import json,sys
+path=sys.argv[1]
+sid=None
+with open(path) as f:
+    for line in f:
+        line=line.strip()
+        if not line: continue
+        try: o=json.loads(line)
+        except Exception: continue
+        if o.get("event")=="session-start":
+            sid=o.get("session")
+print(sid or "")
+PY
+}
+
+session_unterminated() {
+  python3 - "$CLOCK" <<'PY'
+import json,sys
+path=sys.argv[1]
+open_sid=None
+ended=set()
+started=[]
+with open(path) as f:
+    for line in f:
+        line=line.strip()
+        if not line: continue
+        try: o=json.loads(line)
+        except Exception: continue
+        ev=o.get("event"); sid=o.get("session")
+        if ev=="session-start":
+            started.append(o)
+            open_sid=sid
+        elif ev=="session-end":
+            ended.add(sid)
+            open_sid=None
+if open_sid and open_sid not in ended:
+    # last event time for this session
+    last=None
+    with open(path) as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try: o=json.loads(line)
+            except Exception: continue
+            if o.get("session")==open_sid:
+                last=o
+    if last:
+        print(open_sid + "\t" + last.get("at",""))
+PY
+}
+
+hours_between() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+from datetime import datetime
+a=datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ")
+b=datetime.strptime(sys.argv[2], "%Y-%m-%dT%H:%M:%SZ")
+print(round((b-a).total_seconds()/3600, 2))
+PY
+}
+
+cmd_start() {
+  local plan_arg="${1:-}"
+  local unter
+  unter="$(session_unterminated || true)"
+  if [[ -n "$unter" ]]; then
+    local old_sid old_at
+    old_sid="$(printf '%s' "$unter" | cut -f1)"
+    old_at="$(printf '%s' "$unter" | cut -f2)"
+    append_event "{\"schema\":\"keel.clock/1\",\"event\":\"session-end\",\"at\":\"${old_at}\",\"session\":\"${old_sid}\",\"note\":\"closed-by-next-start\"}"
+    # Mark unterminated in sessions if template exists
+    if [[ -f "$SESSIONS" ]]; then
+      printf '| %s | %s | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | unterminated — closed by next start |\n' \
+        "$old_sid" "$old_at" >> "$SESSIONS"
+    fi
+  fi
+
+  local now sid planned planned_hours
+  now="$(utc_now)"
+  sid="$now"
+  planned="[]"
+  planned_hours=0
+  if [[ -n "$plan_arg" ]]; then
+    planned="$(PLAN_CSV="$plan_arg" python3 -c 'import json,os; print(json.dumps([x for x in os.environ.get("PLAN_CSV","").split(",") if x]))')"
+  elif [[ -f "$PLAN_JSON" ]]; then
+    planned="$(python3 - "$PLAN_JSON" <<'PY'
+import json,sys
+try:
+  p=json.load(open(sys.argv[1]))
+  ids=[s["id"] for s in p.get("open_slices", p.get("slices", [])) if s.get("status") in ("todo","doing",None,"open","in-progress")][:5]
+  print(json.dumps(ids))
+except Exception:
+  print("[]")
+PY
+)"
+  fi
+
+  append_event "{\"schema\":\"keel.clock/1\",\"event\":\"session-start\",\"at\":\"${now}\",\"session\":\"${sid}\",\"planned\":${planned},\"planned_hours\":${planned_hours}}"
+
+  local left="(see docs/PROGRESS.md + docs/.keel/plan.json)"
+  if [[ -f "$PLAN_JSON" ]]; then
+    left="$(python3 - "$PLAN_JSON" <<'PY'
+import json,sys
+try:
+  p=json.load(open(sys.argv[1]))
+  rem=p.get("remaining_hours", "?")
+  print(f"remaining_hours={rem}")
+except Exception as e:
+  print("plan unreadable")
+PY
+)"
+  fi
+
+  cat <<EOF
+Session start — $(local_now) (system clock)
+UTC: ${now}
+Session id: ${sid}
+Left: ${left}
+Planned: ${planned}
+EOF
+}
+
+cmd_end() {
+  local sid now start_at wall paused active left pace projected pace_disp proj_disp
+  sid="$(latest_session_id)"
+  [[ -n "$sid" ]] || { echo "keel-time: no open session" >&2; exit 1; }
+  now="$(utc_now)"
+  start_at="$sid"
+  wall="$(hours_between "$start_at" "$now")"
+  paused="$(python3 - "$CLOCK" "$sid" <<'PY'
+import json,sys
+from datetime import datetime
+path, sid = sys.argv[1], sys.argv[2]
+pause_at=None
+paused=0.0
+def parse(t):
+  return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
+with open(path) as f:
+  for line in f:
+    line=line.strip()
+    if not line: continue
+    try: o=json.loads(line)
+    except Exception: continue
+    if o.get("session")!=sid: continue
+    ev=o.get("event"); at=o.get("at")
+    if ev=="pause":
+      pause_at=at
+    elif ev=="resume" and pause_at:
+      paused += (parse(at)-parse(pause_at)).total_seconds()/3600
+      pause_at=None
+print(round(paused, 2))
+PY
+)"
+  active="$(python3 -c "print(round(float('$wall')-float('$paused'), 2))")"
+  append_event "{\"schema\":\"keel.clock/1\",\"event\":\"session-end\",\"at\":\"${now}\",\"session\":\"${sid}\"}"
+
+  if [[ -x "$PLAN_REGEN" ]]; then
+    "$PLAN_REGEN" >/dev/null || true
+  fi
+
+  left="—"; pace="null"; projected="null"
+  if [[ -f "$PLAN_JSON" ]]; then
+    read -r left pace projected < <(python3 - "$PLAN_JSON" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+left=p.get("remaining_hours", "—")
+pace=p.get("pace_factor", None)
+proj=p.get("projected_remaining_hours", None)
+print(left, "null" if pace is None else pace, "null" if proj is None else proj)
+PY
+)
+  fi
+  if [[ "$pace" == "null" ]]; then
+    pace_disp="—"
+    proj_disp="—"
+  else
+    pace_disp="$pace"
+    proj_disp="$projected"
+  fi
+
+  if [[ -f "$SESSIONS" ]]; then
+    # Slice h / Max concurrency / Throughput / Projection basis (v7.3.1 columns).
+    local slice_h="—" max_conc="1" throughput="—" proj_basis="pace"
+    if [[ -x "$ROOT/scripts/keel-clock" ]]; then
+      local clock_json
+      clock_json="$("$ROOT/scripts/keel-clock" report --log "$CLOCK" --session "$sid" --parallel 2>/dev/null || true)"
+      if [[ -n "$clock_json" ]]; then
+        read -r slice_h max_conc throughput proj_basis < <(python3 -c '
+import json,sys
+try:
+  o=json.loads(sys.argv[1])
+except Exception:
+  print("— 1 — pace"); raise SystemExit
+print(
+  o.get("slice_hours", o.get("slice_h", "—")),
+  o.get("max_concurrency", o.get("max_conc", "1")),
+  o.get("throughput", "—"),
+  o.get("projection_basis", o.get("basis", "pace")),
+)
+' "$clock_json" 2>/dev/null || echo "— 1 — pace")
+      fi
+    fi
+    printf '| %s | %s | %s | %s | — | — | — | %s | — | — | %s | %s | %s | %s | %s | %s | %s | %s | |\n' \
+      "$start_at" "$now" "$wall" "$paused" "$active" "$left" "$active" "$pace_disp" "$proj_disp" \
+      "$slice_h" "$max_conc" "$throughput" "$proj_basis" >> "$SESSIONS"
+  fi
+
+  cat <<EOF
+Session end — $(local_now) (system clock)
+UTC start: ${start_at}
+UTC end:   ${now}
+Wall-clock h: ${wall}
+Paused h: ${paused}
+Active h: ${active} (wall-clock minus pauses)
+Planned hours: (see session start / plan.json)
+Done slices: (update sprint frontmatter when slices close)
+Deviation on finished work: (see plan.json deviation_hours)
+Left according to plan: ${left} h of AI working time plus supervision
+Projection if the observed pace continues: $(
+  if [[ "$pace" == "null" ]]; then
+    echo "unavailable — no measured completed work"
+  else
+    echo "${proj_disp} h (factor ${pace_disp})"
+  fi
+)
+EOF
+}
+
+cmd_report() {
+  local sid
+  sid="$(latest_session_id)"
+  echo "Session report — id=${sid:-none}"
+  echo "Clock file: $CLOCK ($(wc -l < "$CLOCK" | tr -d ' ') events)"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/keel-time <start|end|report|slice-start|slice-end|slice-record|pause|resume> [...]
+  start [--plan S-001,S-002]
+  end
+  report
+  slice-start <id>
+  slice-end <id> --status <done|in-progress|blocked>
+  slice-record <id> --result <path> --status <done|in-progress|blocked>
+  pause <reason>
+  resume
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    start)
+      local plan=""
+      if [[ "${1:-}" == --plan ]]; then plan="$2"; fi
+      if [[ "${1:-}" == --plan=* ]]; then plan="${1#--plan=}"; fi
+      cmd_start "$plan"
+      ;;
+    end) cmd_end ;;
+    report) cmd_report ;;
+    slice-start)
+      local id="${1:?slice id}"; local now sid
+      sid="$(latest_session_id)"; now="$(utc_now)"
+      append_event "{\"schema\":\"keel.clock/1\",\"event\":\"slice-start\",\"at\":\"${now}\",\"session\":\"${sid}\",\"slice\":\"${id}\"}"
+      echo "slice-start $id at $now"
+      ;;
+    slice-end)
+      local id="${1:?slice id}"; shift
+      local status="done"
+      if [[ "${1:-}" == --status ]]; then status="${2:-done}"; fi
+      local now sid
+      sid="$(latest_session_id)"; now="$(utc_now)"
+      # Closes only this slice — never other open slices (v7.3.1 overlapping intervals).
+      append_event "{\"schema\":\"keel.clock/1\",\"event\":\"slice-end\",\"at\":\"${now}\",\"session\":\"${sid}\",\"slice\":\"${id}\",\"status\":\"${status}\"}"
+      echo "slice-end $id status=$status at $now (mark actual_hours in sprint frontmatter)"
+      ;;
+    slice-record)
+      # Worker-observed interval at coordinator integration (v7.3.1).
+      local id="${1:?slice id}"; shift
+      local result="" status="done"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --result) result="$2"; shift 2 ;;
+          --status) status="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      [[ -n "$result" ]] || { echo "slice-record needs --result <path>" >&2; exit 1; }
+      local sid
+      sid="$(latest_session_id)"
+      if [[ -x "$ROOT/scripts/keel-clock" ]]; then
+        "$ROOT/scripts/keel-clock" record-worker --log "$CLOCK" --session "$sid" --result "$result" --status "$status" "$id"
+      else
+        echo "keel-clock missing; cannot slice-record" >&2
+        exit 1
+      fi
+      echo "slice-record $id status=$status"
+      ;;
+    pause)
+      local reason="${*:-unspecified}"; local now sid
+      sid="$(latest_session_id)"; now="$(utc_now)"
+      append_event "{\"schema\":\"keel.clock/1\",\"event\":\"pause\",\"at\":\"${now}\",\"session\":\"${sid}\",\"reason\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$reason")}"
+      echo "paused: $reason"
+      ;;
+    resume)
+      local now sid
+      sid="$(latest_session_id)"; now="$(utc_now)"
+      append_event "{\"schema\":\"keel.clock/1\",\"event\":\"resume\",\"at\":\"${now}\",\"session\":\"${sid}\"}"
+      echo "resumed at $now"
+      ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

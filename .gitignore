@@ -1,0 +1,27 @@
+# Keel / assistant personal (never commit)
+CLAUDE.local.md
+.claude/settings.local.json
+AGENTS.override.md
+.gemini/.env
+.gemini/tmp/
+docs/.keel/clock.jsonl
+docs/continuation-prompt.md
+.keel-update-check
+docs/security-audit/
+
+# Dependencies & build
+node_modules/
+dist/
+build/
+.cache/
+*.log
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
